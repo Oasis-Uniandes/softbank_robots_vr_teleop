@@ -38,6 +38,8 @@ To run this project, you need to create a Catkin workspace and clone the necessa
     git clone https://github.com/leggedrobotics/vr_haptic_msgs.git
     git clone https://github.com/ethz-asl/nvblox_ros1.git
     git clone https://github.com/Oasis-Uniandes/softbank_robots_vr_teleop.git
+    git clone https://github.com/SinfonIAUniandes/robot_toolkit_msgs
+    git clone https://github.com/ros-naoqi/naoqi_bridge_msgs
     ```
 
 4.  Build the workspace:
@@ -63,12 +65,18 @@ To run this project, you need to create a Catkin workspace and clone the necessa
 
 ## Configuration
 
-To switch between **NAO** and **Pepper**, you need to edit the [`vr_teleop_node.py`](src/softbank_robots_vr_teleop/scripts/vr_teleop_node.py) file.
+To switch between **NAO** and **Pepper**, you can set the `robot_type` private parameter when running the node. The default value is `NAO`.
 
-In the `__init__` method of the `VRTeleopNode` class, change the robot type passed to the `HeadsetToRobotRotation` constructor:
+For example, to run the node for **Pepper**:
+```bash
+rosrun softbank_robots_vr_teleop vr_teleop_node.py _robot_type:=PEPPER
+```
 
-```python
-        # Initialize headset to robot rotation converter
-        # Change "NAO" to "Pepper" if using Pepper robot
-        self.rotation_converter = HeadsetToRobotRotation("NAO")
+You can also include this in a launch file:
+```xml
+<launch>
+    <node pkg="softbank_robots_vr_teleop" type="vr_teleop_node.py" name="vr_teleop_node" output="screen">
+        <param name="robot_type" value="PEPPER" />
+    </node>
+</launch>
 ```

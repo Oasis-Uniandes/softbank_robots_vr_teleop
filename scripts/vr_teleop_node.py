@@ -4,6 +4,7 @@ import rospy
 from sensor_msgs.msg import Joy
 from geometry_msgs.msg import Twist, PoseStamped
 from robot_toolkit_msgs.srv import go_to_posture_srv
+from robot_toolkit_msgs.msg import set_angles_msg
 from naoqi_bridge_msgs.msg import JointAnglesWithSpeed
 from logic.headset_pose2_rotation import HeadsetToRobotRotation
 
@@ -19,6 +20,9 @@ class VRTeleopNode:
         # Inicializar el nodo
         rospy.init_node('vr_teleop_node', anonymous=True)
         
+        # Get robot type from ROS parameter server, default to "NAO"
+        self.robot_type = rospy.get_param('~robot_type', 'NAO').upper()
+        
         # Parámetros del nodo
         self.max_linear_vel = 0.3
         self.max_angular_vel = 0.5
@@ -28,8 +32,7 @@ class VRTeleopNode:
         self.head_sensitivity = 1.5  # Increase this to make the robot head move more with less headset movement
 
         # Initialize headset to robot rotation converter
-        # Change "NAO" to "Pepper" if using Pepper robot
-        self.rotation_converter = HeadsetToRobotRotation("NAO")
+        self.rotation_converter = HeadsetToRobotRotation(self.robot_type)
         
         # Suscriptor al tópico del joystick
         self.joy_subscriber = rospy.Subscriber("/quest/joystick",Joy, self.joy_callback, queue_size=1)
@@ -40,8 +43,13 @@ class VRTeleopNode:
         # Publicador para comandos de velocidad
         self.cmd_vel_publisher = rospy.Publisher("/cmd_vel", Twist, queue_size=1)
 
-        # Publicador para movimiento de cabeza
-        self.head_publisher = rospy.Publisher("/joint_angles", JointAnglesWithSpeed, queue_size=1)
+        # Publicador para movimiento de cabeza - topic and message type depend on robot
+        if self.robot_type == "NAO":
+            # NAO uses /joint_angles topic with JointAnglesWithSpeed message
+            self.head_publisher = rospy.Publisher("/joint_angles", JointAnglesWithSpeed, queue_size=1)
+        else:  # PEPPER
+            # Pepper uses /set_angles topic with set_angles_msg message
+            self.head_publisher = rospy.Publisher("/set_angles", set_angles_msg, queue_size=1)
 
         # Go to posture proxy
         self.go_to_posture_srv = rospy.ServiceProxy("/pytoolkit/ALRobotPosture/go_to_posture_srv", go_to_posture_srv)
@@ -51,7 +59,10 @@ class VRTeleopNode:
         rospy.loginfo(f"VR Teleop Node iniciado")
         rospy.loginfo(f"Escuchando joystick en: /quest/joystick")
         rospy.loginfo(f"Publicando comandos en: /cmd_vel")
-        rospy.loginfo(f"Publicando movimientos de cabeza en: /joint_angles")
+        if self.robot_type == "NAO":
+            rospy.loginfo(f"Publicando movimientos de cabeza en: /joint_angles (JointAnglesWithSpeed)")
+        else:
+            rospy.loginfo(f"Publicando movimientos de cabeza en: /set_angles (set_angles_msg)")
 
     def move_head(self, yaw_degrees, pitch_degrees):
         """
@@ -65,13 +76,20 @@ class VRTeleopNode:
         yaw_radians = yaw_degrees * 3.14159265359 / 180.0
         pitch_radians = pitch_degrees * 3.14159265359 / 180.0
         
-        # Crear mensaje
-        head_msg = JointAnglesWithSpeed()
-        head_msg.header.stamp = rospy.Time.now()
-        head_msg.joint_names = ['HeadYaw', 'HeadPitch']
-        head_msg.joint_angles = [yaw_radians, pitch_radians]
-        head_msg.speed = self.head_movement_speed
-        head_msg.relative = 0  # Absolute positioning
+        if self.robot_type == "NAO":
+            # NAO uses JointAnglesWithSpeed message
+            head_msg = JointAnglesWithSpeed()
+            head_msg.header.stamp = rospy.Time.now()
+            head_msg.joint_names = ['HeadYaw', 'HeadPitch']
+            head_msg.joint_angles = [yaw_radians, pitch_radians]
+            head_msg.speed = self.head_movement_speed
+            head_msg.relative = 0  # Absolute positioning
+        else:  # PEPPER
+            # Pepper uses set_angles_msg message
+            head_msg = set_angles_msg()
+            head_msg.names = ['HeadYaw', 'HeadPitch']
+            head_msg.angles = [yaw_radians, pitch_radians]
+            head_msg.fraction_max_speed = [self.head_movement_speed, self.head_movement_speed]
         
         # Publicar
         self.head_publisher.publish(head_msg)
@@ -95,9 +113,10 @@ class VRTeleopNode:
             head_yaw *= self.head_sensitivity
             head_pitch *= self.head_sensitivity
             
-            # Clamp to robot limits after scaling
-            head_yaw = max(-119.5, min(119.5, head_yaw))
-            head_pitch = max(-38.5, min(29.5, head_pitch))
+            # Clamp to robot limits after scaling (use robot-specific limits)
+            limits = self.rotation_converter.get_robot_limits()
+            head_yaw = max(limits['yaw_limits'][0], min(limits['yaw_limits'][1], head_yaw))
+            head_pitch = max(limits['pitch_limits'][0], min(limits['pitch_limits'][1], head_pitch))
             
             rospy.loginfo(f"Headset -> Robot Head: Yaw={head_yaw:.2f}°, Pitch={-head_pitch:.2f}°")
             

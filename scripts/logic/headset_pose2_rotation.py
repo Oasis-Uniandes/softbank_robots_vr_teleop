@@ -10,18 +10,18 @@ class HeadsetToRobotRotation:
         Initialize the converter with robot-specific angle limits
         
         Args:
-            robot_type (str): "NAO" or "Pepper"
+            robot_type (str): "NAO" or "PEPPER"
         """
-        self.robot_type = robot_type
+        self.robot_type = robot_type.upper()
         
-        if robot_type == "NAO":
+        if self.robot_type == "NAO":
             self.yaw_limits = (-119.5, 119.5)  # degrees
             self.pitch_limits = (-38.5, 29.5)  # degrees
-        elif robot_type == "Pepper":
+        elif self.robot_type == "PEPPER":
             self.yaw_limits = (-119.5, 119.5)  # degrees
             self.pitch_limits = (-40.5, 25.5)  # degrees
         else:
-            raise ValueError("Robot type must be 'NAO' or 'Pepper'")
+            raise ValueError("Robot type must be 'NAO' or 'PEPPER'")
     
     def quaternion_to_euler(self, quaternion):
         """
@@ -79,7 +79,7 @@ class HeadsetToRobotRotation:
             headset_quaternion: geometry_msgs/Quaternion from headset
             
         Returns:
-            tuple: (head_yaw, head_pitch) in degrees, clamped to robot limits
+            tuple: (head_yaw, head_pitch) in degrees
         """
         # Convert quaternion to euler angles
         roll, pitch, yaw = self.quaternion_to_euler(headset_quaternion)
@@ -94,10 +94,6 @@ class HeadsetToRobotRotation:
         # You may need to adjust the signs based on your coordinate system conventions
         head_yaw = yaw_deg
         head_pitch = -pitch_deg  # Often pitch is inverted
-        
-        # Clamp to robot limits
-        head_yaw = self.clamp_angle(head_yaw, self.yaw_limits)
-        head_pitch = self.clamp_angle(head_pitch, self.pitch_limits)
         
         return head_yaw, head_pitch
     
