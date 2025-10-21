@@ -47,9 +47,11 @@ class VRTeleopNode:
         if self.robot_type == "NAO":
             # NAO uses /joint_angles topic with JointAnglesWithSpeed message
             self.head_publisher = rospy.Publisher("/joint_angles", JointAnglesWithSpeed, queue_size=1)
+            self.head_sensitivity = 1.5  # Increase this to make the robot head move more with less headset movement
         else:  # PEPPER
             # Pepper uses /set_angles topic with set_angles_msg message
             self.head_publisher = rospy.Publisher("/set_angles", set_angles_msg, queue_size=1)
+            self.head_sensitivity = 1  # Increase this to make the robot head move more with less headset movement
 
         # Go to posture proxy
         self.go_to_posture_srv = rospy.ServiceProxy("/pytoolkit/ALRobotPosture/go_to_posture_srv", go_to_posture_srv)
