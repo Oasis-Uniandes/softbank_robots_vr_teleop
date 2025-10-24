@@ -8,6 +8,8 @@ from robot_toolkit_msgs.msg import set_angles_msg, motion_tools_msg, navigation_
 from robot_toolkit_msgs.srv import motion_tools_srv, navigation_tools_srv, vision_tools_srv
 from naoqi_bridge_msgs.msg import JointAnglesWithSpeed
 from logic.headset_pose2_rotation import HeadsetToRobotRotation
+from tf.transformations import euler_from_quaternion
+import numpy as np
 
 class VRTeleopNode:
     """
@@ -34,6 +36,10 @@ class VRTeleopNode:
 
         # Initialize headset to robot rotation converter
         self.rotation_converter = HeadsetToRobotRotation(self.robot_type)
+
+        # Store user body orientation (from imitation node)
+        self.user_body_yaw = None  # User's body orientation in radians
+        self.headset_yaw = None  # Absolute headset orientation in radians
 
         # Publicador para movimiento de cabeza - topic and message type depend on robot
         if self.robot_type == "NAO":
@@ -95,6 +101,9 @@ class VRTeleopNode:
         # Suscriptor al tópico de posicion del headset
         self.headset_subscriber = rospy.Subscriber("/quest/pose/headset", PoseStamped, self.headset_callback, queue_size=1)
 
+        # Suscriptor al tópico de orientación del usuario (body orientation from imitation node)
+        self.user_orientation_subscriber = rospy.Subscriber("/user_orientation", PoseStamped, self.user_orientation_callback, queue_size=1)
+
         # Publicador para comandos de velocidad
         self.cmd_vel_publisher = rospy.Publisher("/cmd_vel", Twist, queue_size=1)
         # Go to posture proxy
@@ -104,6 +113,7 @@ class VRTeleopNode:
 
         rospy.loginfo(f"VR Teleop Node iniciado")
         rospy.loginfo(f"Escuchando joystick en: /quest/joystick")
+        rospy.loginfo(f"Escuchando orientación del usuario en: /user_orientation")
         rospy.loginfo(f"Publicando comandos en: /cmd_vel")
         if self.robot_type == "NAO":
             rospy.loginfo(f"Publicando movimientos de cabeza en: /joint_angles (JointAnglesWithSpeed)")
@@ -142,6 +152,25 @@ class VRTeleopNode:
         # Publicar
         self.head_publisher.publish(head_msg)
 
+    def user_orientation_callback(self, msg):
+        """
+        Callback que recibe la orientación del cuerpo del usuario desde el nodo de imitación
+        
+        Args:
+            msg (PoseStamped): Mensaje con la orientación del cuerpo del usuario
+        """
+        try:
+            # Extract yaw from user body orientation quaternion
+            orientation = msg.pose.orientation
+            quaternion = [orientation.x, orientation.y, orientation.z, orientation.w]
+            euler = euler_from_quaternion(quaternion)
+            self.user_body_yaw = euler[2]  # Yaw is rotation around Z-axis
+            
+            rospy.loginfo_throttle(2.0, f"User body orientation updated: {np.degrees(self.user_body_yaw):.2f}°")
+            
+        except Exception as e:
+            rospy.logerr(f"Error procesando orientación del usuario: {e}")
+
     def headset_callback(self, msg):
         """
         Callback que se ejecuta cuando llegan datos de la posición del headset
@@ -154,8 +183,29 @@ class VRTeleopNode:
             pose_msg = msg.pose
             orientation = pose_msg.orientation
             
+            # Extract absolute headset yaw
+            quaternion = [orientation.x, orientation.y, orientation.z, orientation.w]
+            euler = euler_from_quaternion(quaternion)
+            self.headset_yaw = euler[2]  # Yaw is rotation around Z-axis
+            
             # Convert headset orientation to robot head angles
             head_yaw, head_pitch = self.rotation_converter.convert_headset_to_robot_angles(orientation)
+            
+            # If we have user body orientation, calculate relative head yaw
+            if self.user_body_yaw is not None:
+                # Calculate relative yaw (where the user is looking relative to their body)
+                relative_yaw = self.headset_yaw - self.user_body_yaw
+                
+                # Normalize angle to [-pi, pi]
+                while relative_yaw > np.pi:
+                    relative_yaw -= 2 * np.pi
+                while relative_yaw < -np.pi:
+                    relative_yaw += 2 * np.pi
+                
+                # Convert to degrees and use as head yaw
+                head_yaw = np.degrees(relative_yaw)
+                
+                rospy.loginfo_throttle(1.0, f"Relative head yaw: {head_yaw:.2f}° (User body: {np.degrees(self.user_body_yaw):.2f}°, Headset: {np.degrees(self.headset_yaw):.2f}°)")
             
             # Apply sensitivity scaling
             head_yaw *= self.head_sensitivity
@@ -166,7 +216,7 @@ class VRTeleopNode:
             head_yaw = max(limits['yaw_limits'][0], min(limits['yaw_limits'][1], head_yaw))
             head_pitch = max(limits['pitch_limits'][0], min(limits['pitch_limits'][1], head_pitch))
             
-            rospy.loginfo(f"Headset -> Robot Head: Yaw={head_yaw:.2f}°, Pitch={-head_pitch:.2f}°")
+            rospy.loginfo_throttle(1.0, f"Headset -> Robot Head: Yaw={head_yaw:.2f}°, Pitch={-head_pitch:.2f}°")
             
             # Move robot head
             self.move_head(head_yaw, -head_pitch)
