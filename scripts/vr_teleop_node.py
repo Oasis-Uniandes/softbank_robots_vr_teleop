@@ -4,7 +4,8 @@ import rospy
 from sensor_msgs.msg import Joy
 from geometry_msgs.msg import Twist, PoseStamped
 from robot_toolkit_msgs.srv import go_to_posture_srv
-from robot_toolkit_msgs.msg import set_angles_msg
+from robot_toolkit_msgs.msg import set_angles_msg, motion_tools_msg, navigation_tools_msg, vision_tools_msg
+from robot_toolkit_msgs.srv import motion_tools_srv, navigation_tools_srv, vision_tools_srv
 from naoqi_bridge_msgs.msg import JointAnglesWithSpeed
 from logic.headset_pose2_rotation import HeadsetToRobotRotation
 
@@ -24,7 +25,7 @@ class VRTeleopNode:
         self.robot_type = rospy.get_param('~robot_type', 'NAO').upper()
         
         # Parámetros del nodo
-        self.max_linear_vel = 0.3
+        self.max_linear_vel = 0.5
         self.max_angular_vel = 0.5
         self.head_movement_speed = 0.3  # Slow speed for head movement (30% of max speed)
 
@@ -33,7 +34,61 @@ class VRTeleopNode:
 
         # Initialize headset to robot rotation converter
         self.rotation_converter = HeadsetToRobotRotation(self.robot_type)
-        
+
+        # Publicador para movimiento de cabeza - topic and message type depend on robot
+        if self.robot_type == "NAO":
+            # NAO uses /joint_angles topic with JointAnglesWithSpeed message
+            self.head_publisher = rospy.Publisher("/joint_angles", JointAnglesWithSpeed, queue_size=1)
+            self.head_sensitivity = 1.5  # Increase this to make the robot head move more with less headset movement
+        else:  # PEPPER
+            rospy.loginfo("Waiting for /robot_toolkit/navigation_tools_srv...")
+            rospy.wait_for_service('/robot_toolkit/navigation_tools_srv', timeout=5.0)
+            navigation_tools_service = rospy.ServiceProxy('/robot_toolkit/navigation_tools_srv', navigation_tools_srv)
+            
+            # Enable the robots cmd_vel topic
+            enable_nav_msg = navigation_tools_msg()
+            enable_nav_msg.command = "custom"
+            enable_nav_msg.tf_enable = True
+            enable_nav_msg.tf_frequency = 50.0
+            enable_nav_msg.cmd_vel_enable = True
+            enable_nav_msg.security_timer = 1
+             
+            navigation_tools_service(enable_nav_msg)
+            rospy.loginfo("Robot command velocity topic enabled successfully")
+            
+            
+            rospy.loginfo("Waiting for /robot_toolkit/vision_tools_srv...")
+            rospy.wait_for_service('/robot_toolkit/vision_tools_srv', timeout=5.0)
+            vision_tools_service = rospy.ServiceProxy('/robot_toolkit/vision_tools_srv', vision_tools_srv)
+            
+            activate_front_camera_msg = vision_tools_msg()
+            activate_front_camera_msg.camera_name = "front_camera"
+            activate_front_camera_msg.command = "enable"
+            
+            vision_tools_service(activate_front_camera_msg)
+            
+            activate_bottom_camera_msg = vision_tools_msg()
+            activate_bottom_camera_msg.camera_name = "bottom_camera"
+            activate_bottom_camera_msg.command = "enable"
+            
+            vision_tools_service(activate_bottom_camera_msg)
+            
+            
+            rospy.loginfo("Waiting for /robot_toolkit/motion_tools_srv...")
+            rospy.wait_for_service('/robot_toolkit/motion_tools_srv', timeout=5.0)
+            motion_tools_service = rospy.ServiceProxy('/robot_toolkit/motion_tools_srv', motion_tools_srv)
+            
+            enable_tf_msg = motion_tools_msg()
+            enable_tf_msg.command = "enable_all"
+            
+            motion_tools_service(enable_tf_msg)
+            rospy.loginfo("Robot TF tree enabled successfully")
+            
+            # Pepper uses /set_angles topic with set_angles_msg message
+            self.head_publisher = rospy.Publisher("/set_angles", set_angles_msg, queue_size=1)
+            self.head_movement_speed = 0.1  # Slow speed for head movement (30% of max speed)
+            self.head_sensitivity = 1  # Increase this to make the robot head move more with less headset movement
+
         # Suscriptor al tópico del joystick
         self.joy_subscriber = rospy.Subscriber("/quest/joystick",Joy, self.joy_callback, queue_size=1)
 
@@ -42,17 +97,6 @@ class VRTeleopNode:
 
         # Publicador para comandos de velocidad
         self.cmd_vel_publisher = rospy.Publisher("/cmd_vel", Twist, queue_size=1)
-
-        # Publicador para movimiento de cabeza - topic and message type depend on robot
-        if self.robot_type == "NAO":
-            # NAO uses /joint_angles topic with JointAnglesWithSpeed message
-            self.head_publisher = rospy.Publisher("/joint_angles", JointAnglesWithSpeed, queue_size=1)
-            self.head_sensitivity = 1.5  # Increase this to make the robot head move more with less headset movement
-        else:  # PEPPER
-            # Pepper uses /set_angles topic with set_angles_msg message
-            self.head_publisher = rospy.Publisher("/set_angles", set_angles_msg, queue_size=1)
-            self.head_sensitivity = 1  # Increase this to make the robot head move more with less headset movement
-
         # Go to posture proxy
         self.go_to_posture_srv = rospy.ServiceProxy("/pytoolkit/ALRobotPosture/go_to_posture_srv", go_to_posture_srv)
         self.go_to_posture_srv.wait_for_service()
@@ -65,6 +109,8 @@ class VRTeleopNode:
             rospy.loginfo(f"Publicando movimientos de cabeza en: /joint_angles (JointAnglesWithSpeed)")
         else:
             rospy.loginfo(f"Publicando movimientos de cabeza en: /set_angles (set_angles_msg)")
+                
+                    
 
     def move_head(self, yaw_degrees, pitch_degrees):
         """
