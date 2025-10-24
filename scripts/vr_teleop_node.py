@@ -250,7 +250,7 @@ class VRTeleopNode:
             cmd_vel.linear.y = -left_stick_horizontal * self.max_linear_vel
             cmd_vel.angular.z = -right_stick_horizontal * self.max_angular_vel
 
-            self.cmd_vel_publisher.publish(cmd_vel)
+            #self.cmd_vel_publisher.publish(cmd_vel)
             print(f"Comando enviado - Linear: {cmd_vel.linear.x:.2f}, Angular: {cmd_vel.angular.z:.2f}")
             
         except Exception as e:
