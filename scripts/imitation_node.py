@@ -150,7 +150,9 @@ class ImitationNode:
             cmd_vel.angular.z = 0.0
         
         # Publish velocity command
-        self.cmd_vel_publisher.publish(cmd_vel)
+        if self.robot_type != 'NAO':
+            # Making NAO rotate can be problematic
+            self.cmd_vel_publisher.publish(cmd_vel)
 
     def get_controller_transforms(self):
         """
