@@ -8,8 +8,10 @@ from robot_toolkit_msgs.msg import set_angles_msg, motion_tools_msg, navigation_
 from robot_toolkit_msgs.srv import motion_tools_srv, navigation_tools_srv, vision_tools_srv
 from naoqi_bridge_msgs.msg import JointAnglesWithSpeed
 from logic.headset_pose2_rotation import HeadsetToRobotRotation
-from tf.transformations import euler_from_quaternion
+from tf.transformations import euler_from_quaternion, quaternion_from_euler
 import numpy as np
+import tf
+from logic.joystick_coordinates2_robot import calculate_user_orientation
 
 class VRTeleopNode:
     """
@@ -99,10 +101,35 @@ class VRTeleopNode:
         self.joy_subscriber = rospy.Subscriber("/quest/joystick",Joy, self.joy_callback, queue_size=1)
 
         # Suscriptor al tópico de posicion del headset
-        self.headset_subscriber = rospy.Subscriber("/quest/pose/headset", PoseStamped, self.headset_callback, queue_size=1)
+        self.headset_subscriber = None
 
-        # Suscriptor al tópico de orientación del usuario (body orientation from imitation node)
-        self.user_orientation_subscriber = rospy.Subscriber("/user_orientation", PoseStamped, self.user_orientation_callback, queue_size=1)
+        # Create a transform listener to get data from /tf
+        self.tf_listener = tf.TransformListener()
+
+        # Publisher for user orientation
+        self.orientation_publisher = rospy.Publisher('/user_orientation', PoseStamped, queue_size=1)
+
+        # Parameters for rotation control
+        self.max_angular_vel = 0.5  # Maximum angular velocity (rad/s)
+        self.angle_tolerance = 0.1  # Tolerance in radians (~5.7 degrees)
+        self.kp_angular = 1  # Proportional gain for angular velocity control
+
+        # Store user orientation
+        self.user_yaw = 0.0
+        self.user_pose = None
+        
+        # Coordinate system alignment
+        self.orientation_offset = 0.0  # Offset between robot and VR coordinate systems
+        self.alignment_complete = False
+        self.alignment_duration = 5.0  # seconds to wait for user alignment
+        self.start_time = None
+        self.linear_velocity = None
+        self.is_moving = False
+
+        # Initialize calibration flag and other attributes
+        self.calibrated = False
+
+        rospy.loginfo("Listening for transforms on /tf topic...")
 
         # Publicador para comandos de velocidad
         self.cmd_vel_publisher = rospy.Publisher("/cmd_vel", Twist, queue_size=1)
@@ -119,8 +146,7 @@ class VRTeleopNode:
             rospy.loginfo(f"Publicando movimientos de cabeza en: /joint_angles (JointAnglesWithSpeed)")
         else:
             rospy.loginfo(f"Publicando movimientos de cabeza en: /set_angles (set_angles_msg)")
-                
-                    
+                           
 
     def move_head(self, yaw_degrees, pitch_degrees):
         """
@@ -152,7 +178,142 @@ class VRTeleopNode:
         # Publicar
         self.head_publisher.publish(head_msg)
 
-    def user_orientation_callback(self, msg):
+    def publish_user_orientation(self, left_pos, right_pos, headset_rot, left_rot=None, right_rot=None):
+        """
+        Calculates and publishes the user's orientation in 2D.
+        The orientation is determined by the vector from the right to the left hand,
+        rotated by -90 degrees around the Z-axis to point forward.
+        """
+        yaw = calculate_user_orientation(left_pos, right_pos, headset_rot, left_rot, right_rot)
+
+        # Store the user yaw for robot rotation control
+        self.user_yaw = yaw
+
+        # Create a quaternion from the 2D yaw
+        orientation_q = quaternion_from_euler(0, 0, yaw)
+
+        # Create a PoseStamped message
+        pose_stamped = PoseStamped()
+        pose_stamped.header.stamp = rospy.Time.now()
+        pose_stamped.header.frame_id = "vr_origin"
+
+        # The position of the orientation arrow will be the average of the hands' position on the ground
+        pose_stamped.pose.position.x = (left_pos[0] + right_pos[0]) / 2
+        pose_stamped.pose.position.y = (left_pos[1] + right_pos[1]) / 2
+        pose_stamped.pose.position.z = 0 # On the ground plane
+
+        # The orientation will be the calculated 2D orientation
+        pose_stamped.pose.orientation.x = orientation_q[0]
+        pose_stamped.pose.orientation.y = orientation_q[1]
+        pose_stamped.pose.orientation.z = orientation_q[2]
+        pose_stamped.pose.orientation.w = orientation_q[3]
+        
+        self.user_pose = pose_stamped
+
+        # Publish the message
+        self.orientation_publisher.publish(pose_stamped)
+        
+    def get_robot_orientation(self):
+        """
+        Gets the current orientation of the robot from /tf.
+        Returns the yaw angle in radians, or None if not available.
+        """
+        try:
+            # Try to get the robot's base_link transform
+            # Common robot base frames: base_link, base_footprint, odom
+            (trans, rot) = self.tf_listener.lookupTransform('/odom', '/base_link', rospy.Time(0))
+            
+            # Convert quaternion to euler angles
+            euler = euler_from_quaternion(rot)
+            robot_yaw = euler[2]  # Yaw is the rotation around Z-axis
+            
+            return robot_yaw
+        except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException) as e:
+            rospy.logwarn_throttle(5.0, f"Could not get robot orientation: {e}")
+            return None
+
+    def rotate_robot_to_user(self):
+        """
+        Rotates the robot to face the user's orientation using cmd_vel.
+        Uses proportional control to smoothly align with the user.
+        """
+
+        # If using nao, rotating to user doesnt work properly
+        if self.robot_type == 'NAO':
+            cmd_vel = Twist()
+        
+            cmd_vel.linear = self.linear_velocity
+            self.cmd_vel_publisher.publish(cmd_vel)
+            return
+
+
+        # Get current robot orientation
+        robot_yaw = self.get_robot_orientation()
+        
+        if robot_yaw is None:
+            rospy.logwarn_throttle(5.0, "Cannot rotate robot: robot orientation not available")
+            return
+        
+        # Apply the orientation offset to compensate for different coordinate systems
+        adjusted_user_yaw = self.user_yaw - self.orientation_offset
+        
+        # Calculate angle difference (shortest path)
+        angle_diff = adjusted_user_yaw - robot_yaw
+        
+        # Normalize angle to [-pi, pi]
+        while angle_diff > np.pi:
+            angle_diff -= 2 * np.pi
+        while angle_diff < -np.pi:
+            angle_diff += 2 * np.pi
+        
+        # Create velocity command
+        cmd_vel = Twist()
+        
+        # Only rotate if the angle difference is above tolerance
+        if abs(angle_diff) > self.angle_tolerance:
+            # Proportional control for smooth rotation
+            angular_vel = self.kp_angular * angle_diff
+            
+            # Clamp to max angular velocity
+            angular_vel = max(-self.max_angular_vel, min(self.max_angular_vel, angular_vel))
+            
+            cmd_vel.angular.z = angular_vel
+            
+            rospy.loginfo_throttle(1.0, f"Rotating robot: angle_diff={np.degrees(angle_diff):.2f}°, vel={angular_vel:.2f} rad/s")
+        else:
+            # Stop rotation when aligned
+            cmd_vel.angular.z = 0.0
+        
+        # Publish velocity command
+        cmd_vel.linear = self.linear_velocity
+        if self.is_moving:
+            # Don't rotate while moving linearly
+            cmd_vel.angular.z = 0.0
+        self.cmd_vel_publisher.publish(cmd_vel)
+            
+
+    def get_controller_transforms(self):
+        """
+        Gets the transforms for left controller, right controller, and headset.
+        Returns (left_transform, right_transform, headset_transform) as tuples of (position, rotation).
+        Returns (None, None, None) if transforms are not available.
+        """
+        try:
+            # Get left controller transform
+            (left_trans, left_rot) = self.tf_listener.lookupTransform('/vr_origin', '/hand_left', rospy.Time(0))
+            
+            # Get right controller transform
+            (right_trans, right_rot) = self.tf_listener.lookupTransform('/vr_origin', '/hand_right', rospy.Time(0))
+            
+            # Get headset transform
+            (headset_trans, headset_rot) = self.tf_listener.lookupTransform('/vr_origin', '/headset', rospy.Time(0))
+            
+            return (left_trans, left_rot), (right_trans, right_rot), (headset_trans, headset_rot)
+        except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException) as e:
+            rospy.logwarn_throttle(5.0, f"Could not get controller transforms: {e}")
+            return None, None, None
+        
+    def rotate_robots_head(self):
         """
         Callback que recibe la orientación del cuerpo del usuario desde el nodo de imitación
         
@@ -161,7 +322,7 @@ class VRTeleopNode:
         """
         try:
             # Extract yaw from user body orientation quaternion
-            orientation = msg.pose.orientation
+            orientation = self.user_pose
             quaternion = [orientation.x, orientation.y, orientation.z, orientation.w]
             euler = euler_from_quaternion(quaternion)
             self.user_body_yaw = euler[2]  # Yaw is rotation around Z-axis
@@ -240,30 +401,82 @@ class VRTeleopNode:
 
             # Mapear axes del joystick a velocidades
             
-            right_stick_horizontal = msg.axes[0]  # Eje horizontal del stick derecho
-            right_stick_vertical = msg.axes[1]    # Eje vertical del stick derecho
+            #right_stick_horizontal = msg.axes[0]  # Eje horizontal del stick derecho
+            #right_stick_vertical = msg.axes[1]    # Eje vertical del stick derecho
 
             left_stick_horizontal = msg.axes[2]   # Eje horizontal del stick izquierdo
             left_stick_vertical = msg.axes[3]     # Eje vertical del stick izquierdo
 
             cmd_vel.linear.x = left_stick_vertical * self.max_linear_vel
             cmd_vel.linear.y = -left_stick_horizontal * self.max_linear_vel
-            cmd_vel.angular.z = -right_stick_horizontal * self.max_angular_vel
+            
+            self.is_moving = True
 
-            #self.cmd_vel_publisher.publish(cmd_vel)
-            print(f"Comando enviado - Linear: {cmd_vel.linear.x:.2f}, Angular: {cmd_vel.angular.z:.2f}")
+            if abs(cmd_vel.linear.x) < 0.1 and abs(cmd_vel.linear.y) < 0.1:
+                cmd_vel.linear.x = 0.0
+                cmd_vel.linear.y = 0.0
+                self.is_moving = False
+
+            self.linear_velocity = cmd_vel.linear
             
         except Exception as e:
             rospy.logerr(f"Error procesando datos del joystick: {e}")
     
     def run(self):
         """
-        Bucle principal del nodo
+        Main loop of the node.
         """
-        rate = rospy.Rate(10)  # 10 Hz
+        rate = rospy.Rate(10)
+
+        self.last_movement_time = rospy.Time.now()
+        self.start_time = rospy.Time.now()
         
+        rospy.loginfo("=" * 60)
+        rospy.loginfo("ALIGNMENT PHASE: Please face the same direction as the robot!")
+        rospy.loginfo(f"You have {self.alignment_duration} seconds to align...")
+        rospy.loginfo("=" * 60)
+
         while not rospy.is_shutdown():
-            # Aquí puedes añadir lógica adicional que se ejecute periódicamente
+            # In each loop, get the latest transforms
+            left_transform, right_transform, headset_transform = self.get_controller_transforms()
+
+            if left_transform and right_transform and headset_transform:
+                # Publish user orientation
+                self.publish_user_orientation(
+                    left_transform[0], right_transform[0], headset_transform[1],
+                    left_transform[1], right_transform[1]
+                )
+                
+                # Check if we're still in the alignment phase
+                elapsed_time = (rospy.Time.now() - self.start_time).to_sec()
+                
+                if not self.alignment_complete:
+                    if elapsed_time < self.alignment_duration:
+                        # Still in alignment phase - show countdown
+                        remaining = self.alignment_duration - elapsed_time
+                        rospy.loginfo_throttle(1.0, f"Alignment phase: {remaining:.1f} seconds remaining...")
+                    else:
+                        # Alignment phase complete - calculate offset
+                        robot_yaw = self.get_robot_orientation()
+                        if robot_yaw is not None:
+                            self.orientation_offset = self.user_yaw - robot_yaw
+                            rospy.loginfo("=" * 60)
+                            rospy.loginfo("ALIGNMENT COMPLETE!")
+                            rospy.loginfo(f"Orientation offset calculated: {np.degrees(self.orientation_offset):.2f}°")
+                            rospy.loginfo("Robot will now track your orientation.")
+                            rospy.loginfo("=" * 60)
+                            self.alignment_complete = True
+
+                            # Suscriptor al tópico de posicion del headset
+                            self.headset_subscriber = rospy.Subscriber("/quest/pose/headset", PoseStamped, self.headset_callback, queue_size=1)
+                        else:
+                            rospy.logwarn("Could not get robot orientation for alignment. Retrying...")
+                            self.start_time = rospy.Time.now()  # Reset timer
+                else:
+                    # Alignment complete - start rotating robot to track user
+                    self.rotate_robot_to_user()
+
+            # Wait for the next cycle
             rate.sleep()
     
     def shutdown(self):
@@ -275,6 +488,8 @@ class VRTeleopNode:
         # Enviar comando de parada
         stop_cmd = Twist()
         self.cmd_vel_publisher.publish(stop_cmd)
+
+        self.go_to_posture_srv("stand")
         
         rospy.loginfo("VR Teleop Node cerrado correctamente")
 
