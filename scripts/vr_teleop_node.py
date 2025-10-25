@@ -313,16 +313,17 @@ class VRTeleopNode:
             rospy.logwarn_throttle(5.0, f"Could not get controller transforms: {e}")
             return None, None, None
         
-    def rotate_robots_head(self):
+    def update_user_body_orientation(self):
         """
-        Callback que recibe la orientación del cuerpo del usuario desde el nodo de imitación
-        
-        Args:
-            msg (PoseStamped): Mensaje con la orientación del cuerpo del usuario
+        Updates the user's body orientation from self.user_pose
+        This is needed for relative head tracking
         """
         try:
+            if self.user_pose is None:
+                return
+                
             # Extract yaw from user body orientation quaternion
-            orientation = self.user_pose
+            orientation = self.user_pose.pose.orientation
             quaternion = [orientation.x, orientation.y, orientation.z, orientation.w]
             euler = euler_from_quaternion(quaternion)
             self.user_body_yaw = euler[2]  # Yaw is rotation around Z-axis
@@ -446,6 +447,9 @@ class VRTeleopNode:
                     left_transform[0], right_transform[0], headset_transform[1],
                     left_transform[1], right_transform[1]
                 )
+                
+                # Update user body orientation for head tracking
+                self.update_user_body_orientation()
                 
                 # Check if we're still in the alignment phase
                 elapsed_time = (rospy.Time.now() - self.start_time).to_sec()
