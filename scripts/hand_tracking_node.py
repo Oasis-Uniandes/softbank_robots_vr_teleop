@@ -8,6 +8,8 @@ No MoveIt - uses ikpy for direct inverse kinematics control.
 import rospy
 import tf
 import numpy as np
+import rospkg
+import os
 from geometry_msgs.msg import PoseStamped
 from naoqi_bridge_msgs.msg import JointAnglesWithSpeed
 from ikpy.chain import Chain
@@ -36,9 +38,17 @@ class HandTrackingNode:
         # Initialize ROS node
         rospy.init_node('hand_tracking_node', anonymous=True)
         
+        # Get an instance of RosPack
+        rospack = rospkg.RosPack()
+        package_path = rospack.get_path('softbank_robots_vr_teleop')
+
+        # Construct file paths
+        default_left_chain = os.path.join(package_path, 'ik_data', 'nao_left_arm.json')
+        default_right_chain = os.path.join(package_path, 'ik_data', 'nao_right_arm.json')
+
         # Get parameters
-        self.left_chain_file = rospy.get_param('~left_chain_file', './nao_left_arm.json')
-        self.right_chain_file = rospy.get_param('~right_chain_file', './nao_right_arm.json')
+        self.left_chain_file = rospy.get_param('~left_chain_file', default_left_chain)
+        self.right_chain_file = rospy.get_param('~right_chain_file', default_right_chain)
         self.control_rate = rospy.get_param('~control_rate', 30)  # Hz - high rate for low latency
         self.calibration_duration = rospy.get_param('~calibration_duration', 5.0)  # seconds
         self.joint_speed = rospy.get_param('~joint_speed', 0.1)  # 30% of max speed
