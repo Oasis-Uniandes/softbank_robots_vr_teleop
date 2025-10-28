@@ -124,6 +124,7 @@ class VRTeleopNode:
         self.alignment_duration = 5.0  # seconds to wait for user alignment
         self.start_time = None
         self.linear_velocity = None
+        self.angular_velocity = None
         self.is_moving = False
 
         # Initialize calibration flag and other attributes
@@ -243,6 +244,7 @@ class VRTeleopNode:
             cmd_vel = Twist()
         
             cmd_vel.linear = self.linear_velocity
+            cmd_vel.angular = self.angular_velocity
             self.cmd_vel_publisher.publish(cmd_vel)
             return
 
@@ -401,9 +403,6 @@ class VRTeleopNode:
             print(msg.axes)
 
             # Mapear axes del joystick a velocidades
-            
-            #right_stick_horizontal = msg.axes[0]  # Eje horizontal del stick derecho
-            #right_stick_vertical = msg.axes[1]    # Eje vertical del stick derecho
 
             left_stick_horizontal = msg.axes[2]   # Eje horizontal del stick izquierdo
             left_stick_vertical = msg.axes[3]     # Eje vertical del stick izquierdo
@@ -419,6 +418,14 @@ class VRTeleopNode:
                 self.is_moving = False
 
             self.linear_velocity = cmd_vel.linear
+
+            if self.robot_type == 'NAO':
+                # NAO can rotate with the right stick
+                right_stick_horizontal = msg.axes[0]  # Eje horizontal del stick derecho
+                #right_stick_vertical = msg.axes[1]    # Eje vertical del stick derecho
+
+                cmd_vel.angular.z = -right_stick_horizontal * self.max_angular_vel
+                self.angular_velocity = cmd_vel.angular
             
         except Exception as e:
             rospy.logerr(f"Error procesando datos del joystick: {e}")
