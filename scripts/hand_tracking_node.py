@@ -63,8 +63,12 @@ class HandTrackingNode:
         self.left_hand_offset = np.zeros(3)
         self.right_hand_offset = np.zeros(3)
         self.headset_position_offset = np.zeros(3)
+        self.left_hand_rot_offset = np.array([0, 0, 0, 1])  # Quaternion offset
+        self.right_hand_rot_offset = np.array([0, 0, 0, 1])  # Quaternion offset
         self.left_robot_calibration_pos = None  # Will be computed from FK
         self.right_robot_calibration_pos = None  # Will be computed from FK
+        self.left_robot_calibration_rot = None  # Will be computed from FK
+        self.right_robot_calibration_rot = None  # Will be computed from FK
         
         # Transform listener
         self.tf_listener = tf.TransformListener()
@@ -203,7 +207,9 @@ class HandTrackingNode:
         sample = {
             'left_hand': np.array(left_tf[0]),
             'right_hand': np.array(right_tf[0]),
-            'headset': np.array(headset_tf[0])
+            'headset': np.array(headset_tf[0]),
+            'left_rot': np.array(left_tf[1]),
+            'right_rot': np.array(right_tf[1])
         }
         self.calibration_samples.append(sample)
         
@@ -224,20 +230,28 @@ class HandTrackingNode:
         avg_left = np.zeros(3)
         avg_right = np.zeros(3)
         avg_headset = np.zeros(3)
+        avg_left_rot = np.zeros(4)
+        avg_right_rot = np.zeros(4)
         
         for sample in self.calibration_samples:
             avg_left += sample['left_hand']
             avg_right += sample['right_hand']
             avg_headset += sample['headset']
+            avg_left_rot += sample['left_rot']
+            avg_right_rot += sample['right_rot']
         
         avg_left /= n_samples
         avg_right /= n_samples
         avg_headset /= n_samples
+        avg_left_rot /= np.linalg.norm(avg_left_rot)  # Normalize quaternion
+        avg_right_rot /= np.linalg.norm(avg_right_rot)  # Normalize quaternion
         
         # Calculate offsets: VR coords relative to headset
         self.left_hand_offset = avg_left - avg_headset
         self.right_hand_offset = avg_right - avg_headset
         self.headset_position_offset = avg_headset
+        self.left_hand_rot_offset = avg_left_rot
+        self.right_hand_rot_offset = avg_right_rot
         
         # Calculate actual NAO hand positions in T-pose using forward kinematics
         # Left arm calibration pose
@@ -250,6 +264,7 @@ class HandTrackingNode:
         
         left_end_effector_frame = self.left_arm_chain.forward_kinematics(left_calibration_joints)
         self.left_robot_calibration_pos = left_end_effector_frame[:3, 3]
+        self.left_robot_calibration_rot = left_end_effector_frame[:3, :3]
         
         # Right arm calibration pose
         right_calibration_joints = np.zeros(len(self.right_arm_chain.links))
@@ -261,10 +276,13 @@ class HandTrackingNode:
         
         right_end_effector_frame = self.right_arm_chain.forward_kinematics(right_calibration_joints)
         self.right_robot_calibration_pos = right_end_effector_frame[:3, 3]
+        self.right_robot_calibration_rot = right_end_effector_frame[:3, :3]
         
         rospy.loginfo(f"Calibration complete! Collected {n_samples} samples")
         rospy.loginfo(f"Left hand offset (VR): {self.left_hand_offset}")
         rospy.loginfo(f"Right hand offset (VR): {self.right_hand_offset}")
+        rospy.loginfo(f"Left hand rotation offset (VR): {self.left_hand_rot_offset}")
+        rospy.loginfo(f"Right hand rotation offset (VR): {self.right_hand_rot_offset}")
         rospy.loginfo(f"Left robot T-pose position: {self.left_robot_calibration_pos}")
         rospy.loginfo(f"Right robot T-pose position: {self.right_robot_calibration_pos}")
         rospy.loginfo("=" * 60)
@@ -272,21 +290,74 @@ class HandTrackingNode:
         self.calibrated = True
         return True
 
-    def transform_hand_to_robot_frame(self, hand_pos, is_left=True):
+    def quaternion_multiply(self, q1, q2):
         """
-        Transform hand position from VR frame to robot base_link frame.
+        Multiply two quaternions.
+        
+        Args:
+            q1, q2: Quaternions [x, y, z, w]
+        
+        Returns:
+            Product quaternion [x, y, z, w]
+        """
+        x1, y1, z1, w1 = q1
+        x2, y2, z2, w2 = q2
+        
+        return np.array([
+            w1*x2 + x1*w2 + y1*z2 - z1*y2,
+            w1*y2 - x1*z2 + y1*w2 + z1*x2,
+            w1*z2 + x1*y2 - y1*x2 + z1*w2,
+            w1*w2 - x1*x2 - y1*y2 - z1*z2
+        ])
+
+    def quaternion_inverse(self, q):
+        """
+        Compute the inverse of a quaternion.
+        
+        Args:
+            q: Quaternion [x, y, z, w]
+        
+        Returns:
+            Inverse quaternion [x, y, z, w]
+        """
+        x, y, z, w = q
+        norm_sq = x*x + y*y + z*z + w*w
+        return np.array([-x, -y, -z, w]) / norm_sq
+
+    def quaternion_to_rotation_matrix(self, q):
+        """
+        Convert quaternion to 3x3 rotation matrix.
+        
+        Args:
+            q: Quaternion [x, y, z, w]
+        
+        Returns:
+            3x3 rotation matrix
+        """
+        x, y, z, w = q
+        
+        return np.array([
+            [1 - 2*(y*y + z*z), 2*(x*y - w*z), 2*(x*z + w*y)],
+            [2*(x*y + w*z), 1 - 2*(x*x + z*z), 2*(y*z - w*x)],
+            [2*(x*z - w*y), 2*(y*z + w*x), 1 - 2*(x*x + y*y)]
+        ])
+
+    def transform_hand_to_robot_frame(self, hand_pos, hand_rot, is_left=True):
+        """
+        Transform hand position and rotation from VR frame to robot base_link frame.
         
         Args:
             hand_pos: Hand position in VR frame [x, y, z]
+            hand_rot: Hand rotation in VR frame [x, y, z, w] (quaternion)
             is_left: True for left hand, False for right hand
         
         Returns:
-            Position in robot frame [x, y, z]
+            Tuple of (position, rotation_matrix) in robot frame
         """
         # Get current headset position
         _, _, headset_tf = self.get_controller_transforms()
         if headset_tf is None:
-            return None
+            return None, None
         
         headset_pos = np.array(headset_tf[0])
         
@@ -295,12 +366,14 @@ class HandTrackingNode:
         
         # Get calibration offset for this hand
         offset = self.left_hand_offset if is_left else self.right_hand_offset
+        rot_offset = self.left_hand_rot_offset if is_left else self.right_hand_rot_offset
         
         # Compute delta from calibration
         delta = hand_relative - offset
         
-        # Get robot calibration position (calculated from forward kinematics)
+        # Get robot calibration position and rotation (calculated from forward kinematics)
         robot_calibration_pos = self.left_robot_calibration_pos if is_left else self.right_robot_calibration_pos
+        robot_calibration_rot = self.left_robot_calibration_rot if is_left else self.right_robot_calibration_rot
         
         # Apply delta (with potential scaling/remapping)
         # VR Y-axis typically maps to robot Y-axis (left-right)
@@ -318,20 +391,32 @@ class HandTrackingNode:
                                              0.25 if is_left else 0.0)  # Y: left/right
         robot_pos[2] = np.clip(robot_pos[2], -0.05, 0.3)  # Z: up/down
         
-        return robot_pos
+        # Compute rotation delta from calibration
+        # Get the relative rotation: delta_rot = current_rot * inverse(calibration_rot)
+        rot_offset_inv = self.quaternion_inverse(rot_offset)
+        hand_rot_array = np.array(hand_rot)
+        delta_rot = self.quaternion_multiply(hand_rot_array, rot_offset_inv)
+        
+        # Apply the delta rotation to the robot's calibration rotation
+        delta_rot_matrix = self.quaternion_to_rotation_matrix(delta_rot)
+        robot_rot = np.dot(robot_calibration_rot, delta_rot_matrix)
+        
+        return robot_pos, robot_rot
 
-    def compute_and_publish_ik(self, target_pos, chain, joint_names, is_left=True):
+    def compute_and_publish_ik(self, target_pos, target_rot, chain, joint_names, is_left=True):
         """
-        Compute IK for target position and publish joint commands.
+        Compute IK for target position and rotation, then publish joint commands.
         
         Args:
             target_pos: Target position [x, y, z] in robot frame
+            target_rot: Target rotation (3x3 rotation matrix) in robot frame
             chain: IKPy chain object
             joint_names: List of joint names for this arm
             is_left: True for left arm, False for right arm
         """
-        # Create target frame
+        # Create target frame with both position and rotation
         target_frame = np.eye(4)
+        target_frame[:3, :3] = target_rot
         target_frame[:3, 3] = target_pos
         
         # Compute inverse kinematics
@@ -380,15 +465,23 @@ class HandTrackingNode:
         else:
             self.right_end_effector_pub.publish(pose_msg)
 
-    def publish_hand_visualization(self, target_pos, is_left=True):
-        """Publish target hand position for RViz visualization."""
+    def publish_hand_visualization(self, target_pos, target_rot, is_left=True):
+        """Publish target hand position and rotation for RViz visualization."""
         pose_msg = PoseStamped()
         pose_msg.header.stamp = rospy.Time.now()
         pose_msg.header.frame_id = "base_link"
         pose_msg.pose.position.x = target_pos[0]
         pose_msg.pose.position.y = target_pos[1]
         pose_msg.pose.position.z = target_pos[2]
-        pose_msg.pose.orientation.w = 1.0
+        
+        # Convert rotation matrix to quaternion for visualization
+        target_frame = np.eye(4)
+        target_frame[:3, :3] = target_rot
+        quaternion = quaternion_from_matrix(target_frame)
+        pose_msg.pose.orientation.x = quaternion[0]
+        pose_msg.pose.orientation.y = quaternion[1]
+        pose_msg.pose.orientation.z = quaternion[2]
+        pose_msg.pose.orientation.w = quaternion[3]
         
         if is_left:
             self.left_hand_viz_pub.publish(pose_msg)
@@ -434,23 +527,29 @@ class HandTrackingNode:
                 left_tf, right_tf, headset_tf = self.get_controller_transforms()
                 
                 if left_tf and right_tf and headset_tf:
-                    # Transform left hand
-                    left_target = self.transform_hand_to_robot_frame(left_tf[0], is_left=True)
-                    if left_target is not None:
-                        self.publish_hand_visualization(left_target, is_left=True)
+                    # Transform left hand (position and rotation)
+                    left_target_pos, left_target_rot = self.transform_hand_to_robot_frame(
+                        left_tf[0], left_tf[1], is_left=True
+                    )
+                    if left_target_pos is not None and left_target_rot is not None:
+                        self.publish_hand_visualization(left_target_pos, left_target_rot, is_left=True)
                         self.compute_and_publish_ik(
-                            left_target,
+                            left_target_pos,
+                            left_target_rot,
                             self.left_arm_chain,
                             self.CALIBRATION_POSE_LEFT['joint_names'],
                             is_left=True
                         )
                     
-                    # Transform right hand
-                    right_target = self.transform_hand_to_robot_frame(right_tf[0], is_left=False)
-                    if right_target is not None:
-                        self.publish_hand_visualization(right_target, is_left=False)
+                    # Transform right hand (position and rotation)
+                    right_target_pos, right_target_rot = self.transform_hand_to_robot_frame(
+                        right_tf[0], right_tf[1], is_left=False
+                    )
+                    if right_target_pos is not None and right_target_rot is not None:
+                        self.publish_hand_visualization(right_target_pos, right_target_rot, is_left=False)
                         self.compute_and_publish_ik(
-                            right_target,
+                            right_target_pos,
+                            right_target_rot,
                             self.right_arm_chain,
                             self.CALIBRATION_POSE_RIGHT['joint_names'],
                             is_left=False
