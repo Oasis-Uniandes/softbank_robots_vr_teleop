@@ -46,7 +46,7 @@ class VRTeleopNode:
         # Publicador para movimiento de cabeza - topic and message type depend on robot
         if self.robot_type == "NAO":
             # NAO uses /joint_angles topic with JointAnglesWithSpeed message
-            self.head_publisher = rospy.Publisher("/joint_angles", JointAnglesWithSpeed, queue_size=1)
+            self.joint_publisher = rospy.Publisher("/joint_angles", JointAnglesWithSpeed, queue_size=1)
             self.head_sensitivity = 1.5  # Increase this to make the robot head move more with less headset movement
         else:  # PEPPER
             rospy.loginfo("Waiting for /robot_toolkit/navigation_tools_srv...")
@@ -93,7 +93,7 @@ class VRTeleopNode:
             rospy.loginfo("Robot TF tree enabled successfully")
             
             # Pepper uses /set_angles topic with set_angles_msg message
-            self.head_publisher = rospy.Publisher("/set_angles", set_angles_msg, queue_size=1)
+            self.joint_publisher = rospy.Publisher("/set_angles", set_angles_msg, queue_size=1)
             self.head_movement_speed = 0.1  # Slow speed for head movement (30% of max speed)
             self.head_sensitivity = 1  # Increase this to make the robot head move more with less headset movement
 
@@ -177,8 +177,27 @@ class VRTeleopNode:
             head_msg.fraction_max_speed = [self.head_movement_speed, self.head_movement_speed]
         
         # Publicar
-        self.head_publisher.publish(head_msg)
+        self.joint_publisher.publish(head_msg)
 
+    def move_hands(self, left_hand_value, right_hand_value):
+        """
+        Controls the opening/closing of NAO's hands based on trigger values.
+        
+        Args:
+            left_hand_value (float): Left hand position from 0 (closed) to 1 (open)
+            right_hand_value (float): Right hand position from 0 (closed) to 1 (open)
+        """
+        # Create message for hand control
+        hand_msg = JointAnglesWithSpeed()
+        hand_msg.header.stamp = rospy.Time.now()
+        hand_msg.joint_names = ['LHand', 'RHand']
+        hand_msg.joint_angles = [1-left_hand_value, 1-right_hand_value]
+        hand_msg.speed = 0.3
+        hand_msg.relative = 0  # Absolute positioning
+        
+        # Publish hand command
+        self.joint_publisher.publish(hand_msg)
+        
     def publish_user_orientation(self, left_pos, right_pos, headset_rot, left_rot=None, right_rot=None):
         """
         Calculates and publishes the user's orientation in 2D.
@@ -426,6 +445,17 @@ class VRTeleopNode:
 
                 cmd_vel.angular.z = -right_stick_horizontal * self.max_angular_vel
                 self.angular_velocity = cmd_vel.angular
+                
+            # The second-to-last axis is the left trigger
+            # The last axis is the right trigger
+            if len(msg.axes) >= 2:
+                left_trigger = msg.axes[-2]   # Left lower trigger
+                right_trigger = msg.axes[-1]  # Right lower trigger
+                
+                # Triggers range from 0 to 1, which matches the hand joint range
+                self.move_hands(left_trigger, right_trigger)
+                
+                rospy.loginfo_throttle(2.0, f"Hand control: L={left_trigger:.2f}, R={right_trigger:.2f}")
             
         except Exception as e:
             rospy.logerr(f"Error procesando datos del joystick: {e}")
